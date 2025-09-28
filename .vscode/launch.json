@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "JAVA_HOME": "/Users/patrick/Library/Java/JavaVirtualMachines/openjdk-18.0.1/Contents/Home",
+                "SPARK_HOME": "/opt/homebrew/opt/apache-spark/libexec",
+                "PYSPARK_PYTHON": "/Users/patrick/Projects/WordCounter/.venv/bin/python"
+            }
+        }
+    ]
+}
