@@ -6,8 +6,8 @@ Alien
 Tragedy
 
 # --- Multiple-Term Queries (5) ---
-# A young hero's journey to save the world
-# Historical drama in ancient Rome
-# The police investigate a complex murder mystery
-# A heist involving a huge diamond and betrayal
-# Funny movie with high-stakes action scenes
+A young hero's journey to save the world
+Historical drama in ancient Rome
+The police investigate a complex murder mystery
+A heist involving a huge diamond and betrayal
+Funny movie with high-stakes action scenes

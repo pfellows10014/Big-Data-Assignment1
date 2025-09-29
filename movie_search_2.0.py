@@ -281,6 +281,89 @@ def single_term_search(term: str, doc_tfidf_rdd: RDD):
 
     return top_10_results
 
+def vectorize_query(query_tokens: list, doc_df_rdd: RDD, N: int) -> dict:
+    """
+    Calculates the TF-IDF vector for a single query using document DF and N.
+    Returns: {term: tfidf_score, ...}
+    """
+    
+    # 1. Calculate Query Term Frequency (raw count)
+    query_tf = {}
+    for term in query_tokens:
+        # Ignore empty strings which might remain if cleaning was imperfect
+        if term: 
+            query_tf[term] = query_tf.get(term, 0) + 1
+        
+    # 2. Get document DF values (collect into a map for efficiency)
+    doc_df_map = doc_df_rdd.collectAsMap()
+    
+    # 3. Calculate Query TF-IDF
+    query_vector = {}
+    
+    for term, tf in query_tf.items():
+        # Use document DF for IDF calculation
+        df = doc_df_map.get(term, 0) 
+        
+        # Calculate IDF: log(N / DF). Avoid division by zero/log(0) with check.
+        if df > 0:
+            idf = math.log(N / df) 
+            
+            # Query TF = Raw Count (since length normalization is less relevant for short queries)
+            query_vector[term] = tf * idf
+            
+    return query_vector
+
+def compute_cosine_similarity(query_vector: dict, doc_tfidf_rdd: RDD) -> list:
+    """
+    Calculates cosine similarity between the query vector and all document vectors.
+    Returns: list of top 10 (similarity_score, movie_id)
+    """
+    
+    # Broadcast the query vector for efficient access by all workers
+    query_vector_bcast = sc.broadcast(query_vector)
+    
+    # Calculate query magnitude once
+    query_mag = math.sqrt(sum(v**2 for v in query_vector.values()))
+    
+    if query_mag == 0:
+        return []
+
+    # Map function to calculate similarity for each document
+    def calculate_similarity(doc_entry):
+        doc_id, doc_vector = doc_entry
+        
+        q_vec = query_vector_bcast.value
+        dot_product = 0.0
+        doc_mag_sq = 0.0 # Calculate doc magnitude squared
+
+        # Calculate dot product and document magnitude
+        for term, doc_score in doc_vector.items():
+            query_score = q_vec.get(term, 0)
+            
+            # Only calculate dot product for terms common to query and document
+            dot_product += query_score * doc_score
+            
+            # Calculate magnitude squared for the document vector
+            doc_mag_sq += doc_score ** 2
+
+        doc_mag = math.sqrt(doc_mag_sq)
+
+        if dot_product > 0 and doc_mag > 0:
+            # Cosine Similarity Formula
+            similarity = dot_product / (query_mag * doc_mag)
+            return (similarity, doc_id)
+        else:
+            return (0.0, doc_id)
+
+    # Filter out zero scores for efficiency, then map to get similarity
+    similarity_rdd = doc_tfidf_rdd.map(calculate_similarity) \
+                                  .filter(lambda x: x[0] > 0.0)
+
+    # Rank and collect top 10 results
+    top_10_results = similarity_rdd.top(10, key=lambda x: x[0])
+
+    return top_10_results
+
 def search_engine_pipeline(query_rdd: RDD, doc_tfidf_rdd: RDD, doc_df_rdd: RDD, N_docs: int, metadata_bcast):
     """
     Processes the tokenized queries and executes the appropriate search method (4a or 4b).
@@ -315,10 +398,27 @@ def search_engine_pipeline(query_rdd: RDD, doc_tfidf_rdd: RDD, doc_df_rdd: RDD, 
                 print("  No documents found containing this term.")
 
         elif len(tokens) > 1:
-            # Requirement 4b: Multi-Term Search (Placeholder for Cosine Similarity)
-            print(f"\n--- Query {query_id} ('{query_text}'): Multi-Term Search (TBD) ---")
-            # The logic for Cosine Similarity will be implemented here later.
-            pass
+            # Requirement 4b: Multi-Term Search (Cosine Similarity)
+            print(f"\n--- Query {query_id} ('{query_text}'): Multi-Term Search (Cosine Similarity) ---")
+            
+            # 1. Vectorize the query using document DF and N
+            query_vector = vectorize_query(tokens, doc_df_rdd, N_docs)
+
+            if not query_vector:
+                print("  Query terms not found in the document corpus.")
+                continue
+
+            # 2. Compute Cosine Similarity against all document vectors
+            results = compute_cosine_similarity(query_vector, doc_tfidf_rdd)
+
+            print(f"Query {query_id} ('{query_text}'): Top 10 Documents by Cosine Similarity:")
+            if results:
+                for rank, (score, movie_id) in enumerate(results):
+                    # Lookup the title using the broadcast dictionary
+                    title = metadata_dict.get(movie_id, "[Title Not Found]")
+                    print(f"  {rank+1}. Movie Title: {title}, Similarity: {score:.4f}")
+            else:
+                print("  No similar documents found.")
         else:
             print(f"Query {query_id}: Ignored (no terms found).")
 
