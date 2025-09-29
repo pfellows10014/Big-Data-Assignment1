@@ -113,6 +113,37 @@ def load_and_preprocess_queries(file_path):
     except Exception as e:
         print(f"Error loading queries from {file_path}: {e}. Returning empty RDD.")
         return sc.emptyRDD()
+    
+def load_and_broadcast_metadata(file_path):
+    """
+    Loads movie metadata (ID and Title) and broadcasts it as a dictionary.
+    Output: Broadcast variable containing {movie_id: movie_title}
+    """
+    print(f"-> Loading and broadcasting movie metadata from {file_path}...")
+    try:
+        # Load TSV data. ID is in column 0 (_c0), Title is in column 2 (_c2).
+        metadata_df = spark.read.csv(
+            file_path,
+            sep='\t',
+            header=False
+        ).select(
+            col("_c0").alias("movie_id"),
+            col("_c2").alias("movie_title")
+        )
+        
+        # Collect data and create Python dictionary {movie_id: movie_title}
+        metadata_dict = metadata_df.rdd.map(
+            lambda row: (row.movie_id, row.movie_title)
+        ).collectAsMap() 
+        
+        # Broadcast the dictionary for use across all workers
+        metadata_bcast = sc.broadcast(metadata_dict)
+        print("Metadata broadcast successful.")
+        return metadata_bcast
+
+    except Exception as e:
+        print(f"Error loading movie metadata: {e}. Using empty dictionary.")
+        return sc.broadcast({})
 
 def calculate_tf(tokenized_rdd: RDD):
     """
@@ -165,29 +196,13 @@ def calculate_tf_idf(tf_rdd: RDD, df_rdd: RDD, N: int):
     Output RDD: (movie_id, {term: TF-IDF_value, ...})"""
 
     print("-> Executing RDD MapReduce for TF-IDF Vectors...")
-
-    print("--- Calculating Document Lengths for Normalization ---")
-    print(tf_rdd.take(5)) 
-    print("-----------------------------------")
-    print(df_rdd.take(5))
-    print("-----------------------------------")
-    print(f"Total documents (N): {N}")
-    print("-----------------------------------")
     
     # 1. Calculate Document Lengths for Normalization
     # x[0] is (term, movie_id), x[1] is TF_count
     doc_lengths = tf_rdd.map(
         lambda x: (x[0][1], x[1]))
     
-    print("--- Sample Document Lengths ---")
-    print(doc_lengths.take(5))  # Sample output
-    print("-------------------------------")
-    
     doc_lengths_rdd = doc_lengths.reduceByKey(lambda x, y: x + y).cache()
-
-    print("--- Sample Reduced Document Lengths ---")
-    print(doc_lengths_rdd.take(5))  # Sample output
-    print("-------------------------------")
 
     # 2. Calculate IDF: IDF = log(N / DF)
     # (x[0] is term, x[1] is DF_count)
@@ -195,17 +210,9 @@ def calculate_tf_idf(tf_rdd: RDD, df_rdd: RDD, N: int):
         lambda x: (x[0], math.log(N / x[1]))
     ).cache()
 
-    print("--- Sample IDF Values ---")
-    print(idf_rdd.take(5))  # Sample output
-    print("-------------------------------")
-
     # 3. Normalize TF: TF = TF_count / doc_length
     # Prepare TF RDD for join: (movie_id, (term, TF_count))
     tf_prep_rdd = tf_rdd.map(lambda x: (x[0][1], (x[0][0], x[1]))).cache()
-
-    print("--- Sample Prepared TF RDD ---")
-    print(tf_prep_rdd.take(5))  # Sample output
-    print("-------------------------------")
 
     # 4 Join with doc_lengths: (movie_id, ((term, TF_count), doc_length))
     # Calculate normalized TF
@@ -217,10 +224,6 @@ def calculate_tf_idf(tf_rdd: RDD, df_rdd: RDD, N: int):
         )
     ).cache()
 
-    print("--- Sample Normalized TF Values ---")
-    print(tf_normalized_rdd.take(5))  # Sample output
-    print("-------------------------------")
-
     # 5. Join with IDF to get TF-IDF: ((term, movie_id), (normalized_TF, IDF))
     # Calculate TF-IDF: TF-IDF = normalized_TF * IDF
     # x[0][1] is movie_id, x[0][0] is term, x[1][0] is normalized_TF, x[1][1] is IDF
@@ -228,22 +231,10 @@ def calculate_tf_idf(tf_rdd: RDD, df_rdd: RDD, N: int):
         lambda x: (x[1][0][0], (x[0], x[1][0][1] * x[1][1]))  # (movie_id, (term, TF-IDF))
     ).cache()
 
-    print("--- Sample TF-IDF Values Before Grouping ---")
-    print(tfidf_rdd.take(5))  # Sample output
-    print("-------------------------------")
-
     # 6. Group by movie_id to get final TF-IDF vectors
     tfidf_vector_rdd = tfidf_rdd.groupByKey().mapValues(dict)
 
-    print("--- Sample TF-IDF Vectors Before Caching ---")
-    print(tfidf_vector_rdd.take(5))  # Sample output
-    print("-------------------------------")
-
     tfidf_vector_rdd.cache()
-
-    print("--- Sample TF-IDF Vectors ---")
-    print(tfidf_vector_rdd.take(5))  # Sample output
-    print("-------------------------------")
 
     return tfidf_vector_rdd
 
@@ -290,13 +281,16 @@ def single_term_search(term: str, doc_tfidf_rdd: RDD):
 
     return top_10_results
 
-def search_engine_pipeline(query_rdd: RDD, doc_tfidf_rdd: RDD, doc_df_rdd: RDD, N_docs: int):
+def search_engine_pipeline(query_rdd: RDD, doc_tfidf_rdd: RDD, doc_df_rdd: RDD, N_docs: int, metadata_bcast):
     """
     Processes the tokenized queries and executes the appropriate search method (4a or 4b).
     """
     
     # Convert query RDD to a list of (query_id, [tokens]) for easy iteration
     queries = query_rdd.collect()
+
+    # Retrieve the broadcast dictionary for lookup
+    metadata_dict = metadata_bcast.value
 
     print("\n--- Starting Search Pipeline ---")
     
@@ -314,7 +308,9 @@ def search_engine_pipeline(query_rdd: RDD, doc_tfidf_rdd: RDD, doc_df_rdd: RDD, 
             print(f"Query {query_id} ('{term}'): Top 10 Documents by TF-IDF Score:")
             if results:
                 for rank, (movie_id, score) in enumerate(results):
-                    print(f"  {rank+1}. Doc ID: {movie_id}, Score: {score:.4f}")
+                    # Lookup the title using the broadcast dictionary
+                    title = metadata_dict.get(movie_id, "[Title Not Found]")
+                    print(f"  {rank+1}. Movie Title: {title}, Score: {score:.4f}")
             else:
                 print("  No documents found containing this term.")
 
@@ -330,6 +326,7 @@ def search_engine_pipeline(query_rdd: RDD, doc_tfidf_rdd: RDD, doc_df_rdd: RDD, 
 if __name__ == "__main__":
     
     PLOT_FILE = "MovieSummaries/plot_summaries.txt"
+    METADATA_FILE = "MovieSummaries/movie.metadata.tsv"
     QUERY_FILE = "search_terms.txt"
 
     print("--- 1. Starting Document TF-IDF Pipeline ---")
@@ -349,21 +346,24 @@ if __name__ == "__main__":
         N_docs = 0 
         
     if N_docs > 0:
-        # 2. Calculate Term Frequency (TF) for documents
+        # Load and broadcast metadata for lookup
+        metadata_bcast = load_and_broadcast_metadata(METADATA_FILE)
+
+        # Calculate Term Frequency (TF) for documents
         doc_tf_rdd = calculate_tf(tokenized_doc_rdd)
 
-        # 3. Calculate DF and final TF-IDF Vectors for the entire corpus
+        # Calculate DF and final TF-IDF Vectors for the entire corpus
         doc_tfidf_vector_rdd, doc_df_rdd = execute_tfidf_pipeline(doc_tf_rdd, N_docs)
         print("Document Corpus TF-IDF calculation complete.")
 
-        # 4. Load and preprocess search queries
+        # Load and preprocess search queries
         query_rdd = load_and_preprocess_queries(QUERY_FILE)
         
-        # 5. Execute the Search Pipeline (including Req 4a)
-        search_engine_pipeline(query_rdd, doc_tfidf_vector_rdd, doc_df_rdd, N_docs)
+        # Execute the Search Pipeline (including Req 4a)
+        search_engine_pipeline(query_rdd, doc_tfidf_vector_rdd, doc_df_rdd, N_docs, metadata_bcast)
         
     else:
         print("\nPipeline aborted: No documents available for processing.")
 
-    # 6. Stop Spark Session
+    # Stop Spark Session
     spark.stop()
