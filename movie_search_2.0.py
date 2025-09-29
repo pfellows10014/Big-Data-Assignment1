@@ -6,7 +6,7 @@ from pyspark.ml.feature import Tokenizer, StopWordsRemover
 from pyspark.sql.functions import col, udf
 from pyspark.sql.types import StringType
 
-# --- 1. GLOBAL SPARK SESSION INITIATION ---
+# --- GLOBAL SPARK SESSION INITIATION ---
 # Handled globally outside the functions
 spark = SparkSession.builder.appName("MovieSearchEngine").getOrCreate()
 sc = spark.sparkContext
@@ -23,13 +23,13 @@ def clean_text_udf():
         
         text = str(text).lower()
         
-        # 1. Replace non-alphanumeric/non-space characters with a single space
+        # Replace non-alphanumeric/non-space characters with a single space
         text = re.sub(r'[^a-z0-9\s]', ' ', text)
         
-        # 2. Collapse multiple spaces into a single space
+        # Collapse multiple spaces into a single space
         text = re.sub(r'\s+', ' ', text)
         
-        # 3. Strip leading/trailing spaces
+        # Strip leading/trailing spaces
         return text.strip()
     
     # Register and return the UDF
@@ -40,7 +40,7 @@ def load_and_preprocess_data(file_path):
     Loads raw data, cleans punctuation, tokenizes, removes stopwords, 
     and returns the final tokenized RDD: (movie_id, [tokens]).
     """
-    # A. Load Data into DataFrame (uses global 'spark' variable)
+    # Load Data into DataFrame (uses global 'spark' variable)
     plots_df = spark.read.csv(
         file_path,
         sep='\t',            
@@ -50,20 +50,20 @@ def load_and_preprocess_data(file_path):
         col("_c1").alias("plot_summary_raw") 
     ).filter(col("plot_summary_raw").isNotNull()) 
 
-    # B. Apply Punctuation Cleaning UDF
+    # Apply Punctuation Cleaning UDF
     plots_cleaned_df = plots_df.withColumn(
         "plot_summary_clean", 
         clean_text_udf()(col("plot_summary_raw"))
     ).select("movie_id", "plot_summary_clean")
 
-    # C. Tokenization and Stopword Removal (PySpark ML features)
+    # Tokenization and Stopword Removal (PySpark ML features)
     tokenizer = Tokenizer(inputCol="plot_summary_clean", outputCol="raw_words")
     words_df = tokenizer.transform(plots_cleaned_df)
 
     remover = StopWordsRemover(inputCol="raw_words", outputCol="filtered_words")
     cleaned_df = remover.transform(words_df).select("movie_id", "filtered_words")
 
-    # D. Convert to RDD and Cache
+    # Convert to RDD and Cache
     tokenized_rdd = cleaned_df.rdd.map(tuple)
     tokenized_rdd.cache()
     
@@ -75,12 +75,12 @@ def load_and_preprocess_queries(file_path):
     Uses RDD operations for efficient sequential ID assignment and filtering comments/empty lines.
     """
     try:
-        # A. Load Data into RDD and assign sequential index
+        # Load Data into RDD and assign sequential index
         # Read the file line-by-line, filter out comments/empty lines, and assign sequential index (0, 1, 2, ...)
         raw_rdd = sc.textFile(file_path).filter(
             lambda line: line.strip() and not line.strip().startswith('#')
         ).zipWithIndex().map(
-            lambda x: (x[1], x[0].strip()) # (index_int, query_raw)
+            lambda x: ((x[1] + 1), x[0].strip()) # (index_int, query_raw)
         ).cache()
 
         if raw_rdd.isEmpty():
@@ -197,24 +197,24 @@ def calculate_tf_idf(tf_rdd: RDD, df_rdd: RDD, N: int):
 
     print("-> Executing RDD MapReduce for TF-IDF Vectors...")
     
-    # 1. Calculate Document Lengths for Normalization
+    # Calculate Document Lengths for Normalization
     # x[0] is (term, movie_id), x[1] is TF_count
     doc_lengths = tf_rdd.map(
         lambda x: (x[0][1], x[1]))
     
     doc_lengths_rdd = doc_lengths.reduceByKey(lambda x, y: x + y).cache()
 
-    # 2. Calculate IDF: IDF = log(N / DF)
+    # Calculate IDF: IDF = log(N / DF)
     # (x[0] is term, x[1] is DF_count)
     idf_rdd = df_rdd.map(
         lambda x: (x[0], math.log(N / x[1]))
     ).cache()
 
-    # 3. Normalize TF: TF = TF_count / doc_length
+    # Normalize TF: TF = TF_count / doc_length
     # Prepare TF RDD for join: (movie_id, (term, TF_count))
     tf_prep_rdd = tf_rdd.map(lambda x: (x[0][1], (x[0][0], x[1]))).cache()
 
-    # 4 Join with doc_lengths: (movie_id, ((term, TF_count), doc_length))
+    # Join with doc_lengths: (movie_id, ((term, TF_count), doc_length))
     # Calculate normalized TF
     # x[1][0][0] is term, x[0] is movie_id, x[1][0][1] is TF_count, x[1][1] is doc_length
     tf_normalized_rdd = tf_prep_rdd.join(doc_lengths_rdd).map(
@@ -224,14 +224,14 @@ def calculate_tf_idf(tf_rdd: RDD, df_rdd: RDD, N: int):
         )
     ).cache()
 
-    # 5. Join with IDF to get TF-IDF: ((term, movie_id), (normalized_TF, IDF))
+    # Join with IDF to get TF-IDF: ((term, movie_id), (normalized_TF, IDF))
     # Calculate TF-IDF: TF-IDF = normalized_TF * IDF
     # x[0][1] is movie_id, x[0][0] is term, x[1][0] is normalized_TF, x[1][1] is IDF
     tfidf_rdd = tf_normalized_rdd.join(idf_rdd).map(
         lambda x: (x[1][0][0], (x[0], x[1][0][1] * x[1][1]))  # (movie_id, (term, TF-IDF))
     ).cache()
 
-    # 6. Group by movie_id to get final TF-IDF vectors
+    # Group by movie_id to get final TF-IDF vectors
     tfidf_vector_rdd = tfidf_rdd.groupByKey().mapValues(dict)
 
     tfidf_vector_rdd.cache()
@@ -246,10 +246,10 @@ def execute_tfidf_pipeline(tf_rdd: RDD, N: int):
         tuple: (doc_tfidf_vector_rdd, doc_df_rdd)
     """
     
-    # 1. Calculate Document Frequency (DF)
+    # Calculate Document Frequency (DF)
     doc_df_rdd = calculate_df(tf_rdd, N)
 
-    # 2. Calculate Final TF-IDF Vectors RDD
+    # Calculate Final TF-IDF Vectors RDD
     doc_tfidf_vector_rdd = calculate_tf_idf(tf_rdd, doc_df_rdd, N)
 
     return doc_tfidf_vector_rdd, doc_df_rdd
@@ -268,7 +268,7 @@ def single_term_search(term: str, doc_tfidf_rdd: RDD):
     """
     print(f"\n--- Searching for single term: '{term}' ---")
     
-    # 1. Filter RDD to keep only documents containing the term and extract the score
+    # Filter RDD to keep only documents containing the term and extract the score
     # x[1] is the dictionary of term: score
     ranking_rdd = doc_tfidf_rdd.filter(
         lambda x: term in x[1]
@@ -276,7 +276,7 @@ def single_term_search(term: str, doc_tfidf_rdd: RDD):
         lambda x: (x[0], x[1][term]) # (movie_id, tfidf_score)
     )
 
-    # 2. Rank and collect top 10 results
+    # Rank and collect top 10 results
     top_10_results = ranking_rdd.top(10, key=lambda x: x[1])
 
     return top_10_results
@@ -287,17 +287,17 @@ def vectorize_query(query_tokens: list, doc_df_rdd: RDD, N: int) -> dict:
     Returns: {term: tfidf_score, ...}
     """
     
-    # 1. Calculate Query Term Frequency (raw count)
+    # Calculate Query Term Frequency (raw count)
     query_tf = {}
     for term in query_tokens:
         # Ignore empty strings which might remain if cleaning was imperfect
         if term: 
             query_tf[term] = query_tf.get(term, 0) + 1
         
-    # 2. Get document DF values (collect into a map for efficiency)
+    # Get document DF values (collect into a map for efficiency)
     doc_df_map = doc_df_rdd.collectAsMap()
     
-    # 3. Calculate Query TF-IDF
+    # Calculate Query TF-IDF
     query_vector = {}
     
     for term, tf in query_tf.items():
@@ -381,9 +381,8 @@ def search_engine_pipeline(query_rdd: RDD, doc_tfidf_rdd: RDD, doc_df_rdd: RDD, 
         query_text = " ".join(tokens)
         
         if len(tokens) == 1:
-            # Requirement 4a: Single-Term Search
             term = tokens[0]
-            if term == '': # Skip if the single term is empty
+            if term == '':
                 continue 
             
             results = single_term_search(term, doc_tfidf_rdd)
@@ -391,24 +390,22 @@ def search_engine_pipeline(query_rdd: RDD, doc_tfidf_rdd: RDD, doc_df_rdd: RDD, 
             print(f"Query {query_id} ('{term}'): Top 10 Documents by TF-IDF Score:")
             if results:
                 for rank, (movie_id, score) in enumerate(results):
-                    # Lookup the title using the broadcast dictionary
                     title = metadata_dict.get(movie_id, "[Title Not Found]")
                     print(f"  {rank+1}. Movie Title: {title}, Score: {score:.4f}")
             else:
                 print("  No documents found containing this term.")
 
         elif len(tokens) > 1:
-            # Requirement 4b: Multi-Term Search (Cosine Similarity)
             print(f"\n--- Query {query_id} ('{query_text}'): Multi-Term Search (Cosine Similarity) ---")
             
-            # 1. Vectorize the query using document DF and N
+            # Vectorize the query using document DF and N
             query_vector = vectorize_query(tokens, doc_df_rdd, N_docs)
 
             if not query_vector:
                 print("  Query terms not found in the document corpus.")
                 continue
 
-            # 2. Compute Cosine Similarity against all document vectors
+            # Compute Cosine Similarity against all document vectors
             results = compute_cosine_similarity(query_vector, doc_tfidf_rdd)
 
             print(f"Query {query_id} ('{query_text}'): Top 10 Documents by Cosine Similarity:")
